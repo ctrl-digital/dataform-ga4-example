@@ -1,6 +1,6 @@
 # Google Analytics 4 Data Transformation with Dataform
 
-This repository contains Dataform scripts for transforming Google Analytics 4 data. 
+This repository contains an example for using Dataform for transforming Google Analytics 4 data into tables with structure data.
 
 ## Introduction
 
