@@ -9,7 +9,7 @@ This project provides an example for managing and transforming Google Analytics 
 ## Features today
 - Create an events table with unnested event parameters
 - Create an session table, with two attribution models
-- Join data from Google Ads transfer to get correct Campaign name for paid ads traffic
+- Join data from Google Ads transfer to get correct Campaign name for Google paid ads traffic
 
 ## Prerequisites
 
