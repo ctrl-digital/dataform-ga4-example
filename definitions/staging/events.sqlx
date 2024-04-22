@@ -1,0 +1,117 @@
+config {
+    description: "Event table, every row is an event",
+    columns: {
+        session_id: "Foreign key - unique value for every session, based on ga cookie",
+        user_pseudo_id: "Foreign key - unique value for every user, based on ga cookie",
+        ga_session_id: "Non-unique value, session start time",
+        event_timestamp: "Timestamp of the event",
+        event_name: "Event name",
+        date: "Date of the event",
+        platform: "WEB / IOS / ANDROID",
+        page_title: "Title of the page",
+        page_referrer: "",
+        page_location: "Path of the page",
+
+        user_params: "An struct with user parameters",
+        an_user_parameter: "an_user_parameter",
+
+        event_params: "An struct with event parameters",
+        an_event_parameter: "an_event_parameter",
+
+        utm_source: "Event scoped - Collected traffic UTM",
+        utm_medium: "Event scoped - Collected traffic UTM",
+        utm_campaign: "Event scoped - Collected traffic UTM",
+        utm_gclid: "Event scoped - Collected traffic UTM",
+        utm_content: "Event scoped - Collected traffic UTM",
+        utm_term: "Event scoped - Collected traffic UTM",
+        utm_campaign_id: "Event scoped - Collected traffic UTM",
+        device: "Device information collected",
+        previous_page_location: "For a page_view event, the prevoius page_location",
+        next_page_location: "For a page_view event, the next page_location",
+    },
+    type: "incremental",
+    tags: ["all","events"],
+    uniqueKey: ['event_date'],
+    bigquery: {
+        clusterBy: ['event_name'],
+        partitionBy: "date",
+        updatePartitionFilter: "date >= date_sub(current_date(),interval 4 DAY)"
+    }
+}
+
+WITH
+  events AS (
+  SELECT
+    CONCAT(${helpers.getEventParam('ga_session_id',"int")}, user_pseudo_id) AS session_id,
+    user_pseudo_id,
+    ${helpers.getEventParam('ga_session_id',"int")} AS ga_session_id,
+    TIMESTAMP_MICROS(event_timestamp) AS event_timestamp,
+    event_name,
+    CAST(event_date AS date format 'YYYYMMDD') AS date,
+    platform,
+    ${helpers.getEventParam('page_title')} AS page_title,
+    ${helpers.getEventParam('page_referrer')} AS page_referrer,
+    ${helpers.getEventParam('page_location')} AS page_location,
+
+    -- Get custom User parameters
+    STRUCT(
+      ${helpers.getUserParam('an_user_parameter')} AS an_user_parameter,
+      ${helpers.getUserParam('another_user_parameter')} AS another_user_parameter
+    ) as user_params,
+
+    --Get custom Event parameters
+    STRUCT(
+      ${helpers.getEventParam('an_event_parameter')} AS an_event_parameter,
+      ${helpers.getEventParam('another_event_parameter')} AS another_event_parameter
+    ) as event_params,
+
+    -- Collected traffic source
+    collected_traffic_source.manual_source AS utm_source,
+    collected_traffic_source.manual_medium AS utm_medium,
+    collected_traffic_source.manual_campaign_name AS utm_campaign,
+    collected_traffic_source.gclid AS utm_gclid,
+    collected_traffic_source.manual_content AS utm_content,
+    collected_traffic_source.manual_term AS utm_term,
+    collected_traffic_source.manual_campaign_id AS utm_campaign_id,
+    -- Device info
+    STRUCT( device.category,
+      device.mobile_brand_name,
+      device.mobile_model_name,
+      device.mobile_marketing_name,
+      device.mobile_os_hardware_model,
+      device.operating_system,
+      device.operating_system_version ) AS device
+    FROM
+       `${constants.GA4_PROJECT}.${constants.GA4_DATASET}.events_*`
+    WHERE
+        _table_suffix >= FORMAT_DATE('%Y%m%d',kickoff_date)
+)
+
+--Calculating previous and next page_location for easier funnel analysis
+SELECT
+  *,
+IF
+  ( event_name = 'page_view', COALESCE( LAST_VALUE(
+      IF
+        (event_name = 'page_view', page_location, NULL) IGNORE NULLS ) OVER (PARTITION BY session_id ORDER BY event_timestamp ASC ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING ), '(entrance)' ), NULL ) AS previous_page_location,
+IF
+  ( event_name = 'page_view', COALESCE( FIRST_VALUE(
+      IF
+        (event_name = 'page_view', page_location, NULL) IGNORE NULLS ) OVER(PARTITION BY session_id ORDER BY event_timestamp ASC ROWS BETWEEN 1 FOLLOWING AND UNBOUNDED FOLLOWING ), '(exit)' ), NULL ) AS next_page_location
+FROM
+  events
+
+pre_operations {
+  DECLARE
+    kickoff_date DEFAULT (
+    ${
+        when(incremental(),
+            `SELECT date_sub(current_date(),interval 4 DAY)`,
+            `SELECT date(${constants.START_DATE})`)
+    }
+    );
+    ${
+        when(incremental(),
+            `delete from ${self()} where date >= date_sub(current_date(),interval 4 DAY);`, ``)
+    }
+}
