@@ -1,0 +1,31 @@
+config {
+    type: "incremental",
+    tags: ["all", "googleads"],
+    uniqueKey: ['gclid'],
+}
+/*
+WITH
+ClickStats AS (
+  SELECT * FROM `${constants.GADS_PROJECT}.${constants.GADS_DATASET}.p_ads_ClickStats_${constants.GADS_ACCOUNT}` 
+  ),
+
+Campaign AS (
+    SELECT * FROM `${constants.GADS_PROJECT}.${constants.GADS_DATASET}.p_ads_Campaign_${constants.GADS_ACCOUNT}`
+)
+
+SELECT
+  ClickStats.click_view_gclid AS gclid,
+  MAX(Campaign.campaign_name) AS campaign_name
+FROM
+  ClickStats
+LEFT JOIN
+  Campaign
+ON
+  Campaign.campaign_id = ClickStats.campaign_id
+GROUP BY
+  gclid
+*/
+
+SELECT
+  "" AS gclid,
+  "" AS campaign_name
