@@ -1,0 +1,185 @@
+config {
+  description: "Session table, every row is an session",
+  columns: {
+    session_id : "Primary key - unique value for every session, CONCAT of ga_session_id and user_pseudo_id",
+    user_pseudo_id : "Foreign key - unique value for every user, based on _ga cookie",
+    ga_session_id : "ga_session_id parameter, non-unique",
+    date : "Date of first event in the session",
+    logged_in : "If the session contains a login event",
+    pages_in_session : "Commaseperated list with all page_paths in the session, starting with the first.",
+    landing_page : "First page_location of the session",
+    device : "Struct with Device information",
+    session_start : "Timestamp for the first event of the session",
+    session_end : "Timestamp for the last event of the session",
+    bounce : "If the session contains only one pageview, it counts as a bounce",
+    session_params : "Struct with session parameters",
+    direct : "Struct with session parameters",
+    last_click_30 : "Struct with session parameters"
+  },
+  type: "incremental",
+  tags: ["all","sessions"],
+  uniqueKey: ["session_id"],
+  bigquery: {
+    partitionBy: "date",
+  }
+}
+
+WITH 
+sessions_step1 AS (
+  SELECT
+    session_id,
+    ARRAY_AGG(user_pseudo_id IGNORE NULLS ORDER BY event_timestamp LIMIT 1)[SAFE_OFFSET(0)] as user_pseudo_id,
+    MIN(ga_session_id) as ga_session_id,
+    MIN(date) as date,
+    MAX(IF(event_name = "login", true, false)) as logged_in,  
+    STRING_AGG(page_location ORDER BY event_timestamp) as pages_in_session,
+    ARRAY_AGG(page_location IGNORE NULLS ORDER BY event_timestamp LIMIT 1)[SAFE_OFFSET(0)] as landing_page,
+
+    ${helpers.getSessionParam('utm_source')},
+    ${helpers.getSessionParam('utm_medium')},
+    ${helpers.getSessionParam('utm_campaign')},
+    ${helpers.getSessionParam('utm_gclid')},
+    ${helpers.getSessionParam('utm_content')},
+    ${helpers.getSessionParam('utm_term')},
+    MAX(gclid.campaign_name) as utm_gclid_campaign_name,
+
+    STRUCT(
+      MAX(device.category) as category,
+      MAX(device.mobile_brand_name) as mobile_brand_name,
+      MAX(device.mobile_model_name) as mobile_model_name	,
+      MAX(device.mobile_marketing_name) as mobile_marketing_name	,
+      MAX(device.mobile_os_hardware_model) as mobile_os_hardware_model	,
+      MAX(device.operating_system) as operating_system	,
+      MAX(device.operating_system_version) as operating_system_version
+    ) AS device,
+
+    MIN(event_timestamp) as session_start,
+    MAX(event_timestamp) as session_end,
+    IF(COUNT(IF(event_name = "page_view",1,0))>1,1,0) AS bounce,
+
+    --Sessions scoped parameters 
+    STRUCT(
+      ${helpers.getSessionParam('event_params.an_event_parameter', "an_session_param")} 
+    ) as session_params,
+
+  FROM ${ref('events')} events
+
+  LEFT JOIN ${ref('gclid')} as gclid
+    ON gclid.gclid = events.utm_gclid
+
+  WHERE session_id is not null
+  GROUP BY session_id
+),
+
+-- Ignore self referrals
+sessions_step2 as (
+SELECT
+    * EXCEPT(utm_source,utm_medium,utm_campaign,utm_gclid,utm_content,utm_term),
+    STRUCT(
+      if(utm_medium = 'referral' and utm_source LIKE ANY ('tagassistant.google.com', ${constants.SELF_REFERRER}), null, utm_source ) as source,
+      if(utm_medium = 'referral' and utm_source LIKE ANY ('tagassistant.google.com', ${constants.SELF_REFERRER}), null, utm_medium ) as medium,
+      if(utm_medium = 'referral' and utm_source LIKE ANY ('tagassistant.google.com', ${constants.SELF_REFERRER}), null, utm_campaign ) as campaign,
+      utm_gclid as gclid,
+      utm_content as content,
+      utm_term as term
+    ) as bq_qp
+FROM sessions_step1
+),
+
+-- Adjust source according to referall OR gclid, otherwise null
+sessions_step3 as (
+  SELECT
+    *, 
+    CASE
+      WHEN bq_qp.gclid is not null THEN struct('google' as source, 'cpc' as medium, ifnull(utm_gclid_campaign_name,ifnull(bq_qp.campaign,'not set')) as campaign, bq_qp.gclid)
+      WHEN bq_qp.medium = 'referral' and REGEXP_CONTAINS(bq_qp.source, r'google\.') THEN struct('google' as source, 'organic' as medium, 'not set' as campaign, bq_qp.gclid)
+      WHEN bq_qp.medium = 'referral' and REGEXP_CONTAINS(bq_qp.source, r'facebook\.|instagram\.') THEN struct('facebook' as source, 'social' as medium, 'not set' as campaign, bq_qp.gclid)
+      WHEN bq_qp.medium = 'referral' and REGEXP_CONTAINS(bq_qp.source, r'linkedin\.') THEN struct('linkedin' as source, 'social' as medium, 'not set' as campaign, bq_qp.gclid)
+      WHEN bq_qp.medium = 'referral' and REGEXP_CONTAINS(bq_qp.source, r'bing\.') THEN struct('bing' as source, 'organic' as medium, 'not set' as campaign, bq_qp.gclid)
+      WHEN bq_qp.medium = 'referral' and REGEXP_CONTAINS(bq_qp.source, r'yahoo\.') THEN struct('yahoo' as source, 'organic' as medium, 'not set' as campaign, bq_qp.gclid)
+      WHEN bq_qp.medium = 'referral' and REGEXP_CONTAINS(bq_qp.source, r'tiktok\.') THEN struct('tiktok' as source, 'social' as medium, 'not set' as campaign, bq_qp.gclid)
+      WHEN bq_qp.medium = 'referral' THEN struct(bq_qp.source as source, 'referral' as medium, COALESCE(bq_qp.campaign,'not set') as campaign, bq_qp.gclid)
+      WHEN coalesce(bq_qp.source, bq_qp.medium, bq_qp.campaign) is not null THEN struct(bq_qp.source as source, bq_qp.medium as medium, ifnull(bq_qp.campaign,'not set') as campaign, bq_qp.gclid)
+    ELSE struct (null as source, null as medium, null as campaign, null as gclid)
+    END as direct
+  FROM sessions_step2  
+),
+
+-- Lookback 30 days to find last non-direct source
+sessions_step4 as (
+    SELECT
+        *, 
+        IF(direct.source IS NULL,
+        last_value(direct.source ignore nulls) over(
+        partition by user_pseudo_id
+        order by ga_session_id 
+        range between 2592000 preceding
+            and 1 preceding 
+        )
+        ,direct.source
+        ) as model_source,
+
+        IF(direct.source IS NULL,
+        last_value(direct.medium ignore nulls) over(
+        partition by user_pseudo_id
+        order by ga_session_id 
+        range between 2592000 preceding
+            and 1 preceding
+
+        )
+        ,direct.medium
+    ) as model_medium,
+
+    IF(direct.source IS NULL,
+        last_value(direct.campaign ignore nulls) over(
+        partition by user_pseudo_id
+        order by ga_session_id 
+        range between 2592000 preceding
+            and 1 preceding
+
+        )
+        ,direct.campaign
+    ) as model_campaign,
+    
+        IF(direct.source IS NULL,
+        last_value(direct.gclid ignore nulls) over(
+        partition by user_pseudo_id
+        order by ga_session_id 
+        range between 2592000 preceding
+            and 1 preceding
+        )
+        ,direct.gclid
+    ) as model_gclid,
+  FROM 
+    sessions_step3
+),
+
+-- Translate null to (direct) 
+sessions_step5 AS (  
+    SELECT 
+        *  EXCEPT(direct, model_source, model_medium, model_campaign, model_gclid),
+
+        IFNULL(direct.source,"(direct)") as direct_source,
+        IFNULL(direct.medium,"(none)") as direct_medium,
+        IFNULL(direct.campaign,"(none)") as direct_campaign,
+        IFNULL(direct.gclid, null) as direct_gclid,
+
+        IFNULL(model_source,"(direct)") as model_source,
+        IFNULL(model_medium,"(none)") as model_medium,
+        IFNULL(model_campaign,"(none)") as model_campaign,
+        IFNULL(model_gclid, null) as model_gclid
+    FROM 
+    sessions_step4
+)
+
+-- Final query, get channelGroup with helper function
+SELECT 
+  *  EXCEPT(direct_source, direct_medium, direct_campaign, direct_gclid, model_source, model_medium, model_campaign,model_gclid, bq_qp, utm_gclid_campaign_name),
+  
+  STRUCT(direct_source as source, direct_medium as medium, direct_campaign as campaign,  ${helpers.getDefaultChannelGroup("direct_source", "direct_medium", "direct_campaign")} as channelgroup, direct_gclid as gclid) as direct,
+  STRUCT(model_source as source, model_medium as medium, model_campaign as campaign,  ${helpers.getDefaultChannelGroup("model_source", "model_medium", "model_campaign")} as channelgroup, model_gclid as gclid ) as last_click_30,
+
+FROM
+    sessions_step5
+
+
